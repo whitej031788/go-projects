@@ -1,0 +1,7 @@
+subscription_id,email,last_payment,next_payment,message
+222,jamie@paddle.com,15.75,18.74,INV_MRR_VALUE
+230,jamie@paddle.com,15.74,18.73,INV_MRR_VALUE
+258,jamie@paddle.com,28.02,59.50,INV_MRR_VALUE
+456,jamie@paddle.com,18.97,47.04,INV_MRR_VALUE
+1823,jamie@paddle.com,0.00,0.00,ZERO_VALUE
+1910,jamie@paddle.com,23.27,203.27,INV_MRR_VALUE

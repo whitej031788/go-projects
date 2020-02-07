@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"crypto/md5"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -23,29 +26,65 @@ func main() {
 	apiResults := callPaddleListUsers()
 
 	if apiResults["success"].(bool) {
+		// Keep track of any subscriptions that we can't determine MRR based on last / next payment
+		file, err := os.Create("bad_subscriptions.csv")
+		checkError("Cannot create file", err)
+		defer file.Close()
+		invalidLines := 0
+		writer := csv.NewWriter(file)
+
+		// Header row
+		err = writeCsvLine([]string{"subscription_id", "email", "last_payment", "next_payment", "message"}, writer)
+		checkError("Cannot write to file", err)
+
 		for _, element := range apiResults["response"].([]interface{}) {
 			theMap := element.(map[string]interface{})
-			theCurrency, theValue := getMRRValue(theMap)
+
+			theCurrency, theValue, lastAmt, nextAmt := getMRRValue(theMap)
 			if theCurrency == "INVALID" {
-				fmt.Println("The last amount and next amount aren't the same, so we aren't sure what the MRR value is:", theMap["subscription_id"].(float64))
+				var data = []string{fmt.Sprintf("%.0f", theMap["subscription_id"].(float64)), theMap["user_email"].(string), fmt.Sprintf("%.2f", lastAmt), fmt.Sprintf("%.2f", nextAmt), "INV_MRR_VALUE"}
+				invalidLines++
+				err := writeCsvLine(data, writer)
+				checkError("Cannot write to file", err)
 				continue
 			}
 
-			planInterval, planId := getPlanInfo(int(theMap["plan_id"].(float64)))
+			planInterval, planID := getPlanInfo(int(theMap["plan_id"].(float64)))
+
+			if theValue == 0 {
+				var data = []string{fmt.Sprintf("%.0f", theMap["subscription_id"].(float64)), theMap["user_email"].(string), fmt.Sprintf("%.2f", lastAmt), fmt.Sprintf("%.2f", nextAmt), "ZERO_VALUE"}
+				invalidLines++
+				err := writeCsvLine(data, writer)
+				checkError("Cannot write to file", err)
+				continue
+			}
 
 			jsonData := map[string]interface{}{
 				"user_alias":         md5Hash(int(theMap["user_id"].(float64))),
 				"subscription_alias": md5Hash(int(theMap["subscription_id"].(float64))),
 				"email":              theMap["user_email"].(string),
-				"plan_id":            planId,
+				"plan_id":            planID,
 				"plan_interval":      planInterval,
 				"plan_currency":      theCurrency,
 				"status":             "active",
 				"value":              theValue,
 				"effective_date":     convertToUnixTimeStamp(theMap["signup_date"].(string), true, false),
 			}
-			bolB, _ := json.Marshal(jsonData)
-			fmt.Println(string(bolB))
+
+			pwSuccess, pwMsg := callProfitwellAPI(jsonData)
+			if !pwSuccess {
+				var data = []string{fmt.Sprintf("%.0f", theMap["subscription_id"].(float64)), theMap["user_email"].(string), fmt.Sprintf("%.2f", lastAmt), fmt.Sprintf("%.2f", nextAmt), pwMsg}
+				invalidLines++
+				err := writeCsvLine(data, writer)
+				checkError("Cannot write to file", err)
+			}
+		}
+
+		defer writer.Flush()
+
+		if invalidLines > 0 {
+			fmt.Printf("\n")
+			fmt.Println("You had some subscriptions we could not determine the MRR value of, or failed to process into Profitwell. Please consult the 'bad_subscriptions.csv' file in this directory")
 		}
 	} else {
 		fmt.Println("The List Users API call failed")
@@ -72,7 +111,7 @@ func callPaddleListUsers() map[string]interface{} {
 	return result
 }
 
-// DEPRECATED FUNCTION BELOW //
+// DEPRECATED FUNCTION START //
 func getSubscriptionCurrency(SubID int) string {
 	currency := ""
 	var result map[string]interface{}
@@ -98,6 +137,8 @@ func getSubscriptionCurrency(SubID int) string {
 
 	return currency
 }
+
+// DEPRECATED FUNCTION END //
 
 func getPlanInfo(planID int) (string, string) {
 	planIDMap := map[int]map[string]string{
@@ -134,7 +175,7 @@ func convertToUnixTimeStamp(dateString string, withHoursMinutesSeconds bool, wit
 	return timeStamp.Unix()
 }
 
-func getMRRValue(theMap map[string]interface{}) (string, float64) {
+func getMRRValue(theMap map[string]interface{}) (string, float64, float64, float64) {
 	nextPayment := theMap["next_payment"].(map[string]interface{})
 	lastPayment := theMap["last_payment"].(map[string]interface{})
 	nextAmount := nextPayment["amount"].(float64)
@@ -145,5 +186,45 @@ func getMRRValue(theMap map[string]interface{}) (string, float64) {
 		theCurr = "INVALID"
 	}
 
-	return theCurr, (nextAmount + lastAmount) / float64(2) * 100
+	return theCurr, ((nextAmount + lastAmount) / float64(2) * 100), lastAmount, nextAmount
+}
+
+func checkError(message string, err error) {
+	if err != nil {
+		log.Fatal(message, err)
+	}
+}
+
+func callProfitwellAPI(apiData map[string]interface{}) (success bool, message string) {
+	result := false
+	returnMessage := ""
+
+	jsonString, _ := json.Marshal(apiData)
+	client := &http.Client{}
+
+	req, _ := http.NewRequest("POST", "https://api.profitwell.com/v2/subscriptions/", bytes.NewBuffer(jsonString))
+	req.Header.Set("Authorization", ProfitwellAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, respErr := client.Do(req)
+
+	data, _ := ioutil.ReadAll(resp.Body)
+	// Profitwell returns a 201 on success
+	if respErr != nil || resp.StatusCode != 201 {
+		fmt.Printf("The Profitwell API call failed %s\n", string(data))
+		returnMessage = "PRF_FAIL_API"
+		result = false
+	} else {
+		json.Unmarshal([]byte(data), &returnMessage)
+		fmt.Printf(returnMessage)
+		result = true
+	}
+	defer resp.Body.Close()
+	return result, returnMessage
+}
+
+func writeCsvLine(data []string, writer *csv.Writer) (err error) {
+	theError := writer.Write(data)
+	checkError("Cannot write to file", err)
+	return theError
 }
