@@ -11,15 +11,8 @@ import (
 	"net/http"
 	"os"
 	"time"
-)
 
-/* Fill out your configuration options below, and then you can run the script from the command line */
-const (
-	PaddleAPIURL     = "https://sandbox-vendors.paddle.com"
-	PaddleVendorID   = "7"
-	PaddleAuthKey    = "bacdaf1fa8dcacd80bcc9829ed5fefaca409cf6121da4aa423"
-	ProfitwellAPIKey = "2F077A41764EA0ACDEE97A4C6BD613F6"
-	EndDate          = "2020-01-30"
+	pwConfig "github.com/whitej031788/profitwell_backfill/config"
 )
 
 func main() {
@@ -37,6 +30,9 @@ func main() {
 		err = writeCsvLine([]string{"subscription_id", "email", "last_payment", "next_payment", "message"}, writer)
 		checkError("Cannot write to file", err)
 
+		// Populate Paddle Plan Info
+		planIDMap := callPaddleListPlans()
+
 		for _, element := range apiResults["response"].([]interface{}) {
 			theMap := element.(map[string]interface{})
 
@@ -49,10 +45,22 @@ func main() {
 				continue
 			}
 
-			planInterval, planID := getPlanInfo(int(theMap["plan_id"].(float64)))
+			planInterval, planID := getPlanInfo(int(theMap["plan_id"].(float64)), planIDMap)
 
 			if theValue == 0 {
 				var data = []string{fmt.Sprintf("%.0f", theMap["subscription_id"].(float64)), theMap["user_email"].(string), fmt.Sprintf("%.2f", lastAmt), fmt.Sprintf("%.2f", nextAmt), "ZERO_VALUE"}
+				invalidLines++
+				err := writeCsvLine(data, writer)
+				checkError("Cannot write to file", err)
+				continue
+			}
+
+			signupDate := convertToUnixTimeStamp(theMap["signup_date"].(string), true, false)
+
+			endDateInUnix := convertToUnixTimeStamp(pwConfig.EndDate, true, false)
+
+			if signupDate > endDateInUnix {
+				var data = []string{fmt.Sprintf("%.0f", theMap["subscription_id"].(float64)), theMap["user_email"].(string), fmt.Sprintf("%.2f", lastAmt), fmt.Sprintf("%.2f", nextAmt), "NEWER_SUB"}
 				invalidLines++
 				err := writeCsvLine(data, writer)
 				checkError("Cannot write to file", err)
@@ -68,19 +76,27 @@ func main() {
 				"plan_currency":      theCurrency,
 				"status":             "active",
 				"value":              theValue,
-				"effective_date":     convertToUnixTimeStamp(theMap["signup_date"].(string), true, false),
+				"effective_date":     signupDate,
 			}
 
-			pwSuccess, pwMsg := callProfitwellAPI(jsonData)
-			if !pwSuccess {
-				var data = []string{fmt.Sprintf("%.0f", theMap["subscription_id"].(float64)), theMap["user_email"].(string), fmt.Sprintf("%.2f", lastAmt), fmt.Sprintf("%.2f", nextAmt), pwMsg}
-				invalidLines++
-				err := writeCsvLine(data, writer)
-				checkError("Cannot write to file", err)
+			if !pwConfig.DryRun {
+				pwSuccess, pwMsg := callProfitwellAPI(jsonData)
+				if !pwSuccess {
+					var data = []string{fmt.Sprintf("%.0f", theMap["subscription_id"].(float64)), theMap["user_email"].(string), fmt.Sprintf("%.2f", lastAmt), fmt.Sprintf("%.2f", nextAmt), pwMsg}
+					invalidLines++
+					err := writeCsvLine(data, writer)
+					checkError("Cannot write to file", err)
+				}
+			} else {
+
 			}
 		}
 
 		defer writer.Flush()
+
+		if pwConfig.DryRun {
+			fmt.Println("This was a dry run; any errors are reported in the console, or written to 'bad_subscriptions.csv' file")
+		}
 
 		if invalidLines > 0 {
 			fmt.Printf("\n")
@@ -99,11 +115,12 @@ func md5Hash(id int) string {
 
 func callPaddleListUsers() map[string]interface{} {
 	var result map[string]interface{}
-	jsonData := map[string]string{"vendor_id": PaddleVendorID, "vendor_auth_code": PaddleAuthKey, "state": "active"}
+	jsonData := map[string]string{"vendor_id": pwConfig.PaddleVendorID, "vendor_auth_code": pwConfig.PaddleAuthKey, "state": "active"}
 	jsonValue, _ := json.Marshal(jsonData)
-	response, err := http.Post(PaddleAPIURL+"/api/2.0/subscription/users", "application/json", bytes.NewBuffer(jsonValue))
+	response, err := http.Post(pwConfig.PaddleAPIURL+"/api/2.0/subscription/users", "application/json", bytes.NewBuffer(jsonValue))
 	if err != nil {
 		fmt.Printf("The List Users API call request failed with error %s\n", err)
+		log.Fatal("")
 	} else {
 		data, _ := ioutil.ReadAll(response.Body)
 		json.Unmarshal([]byte(data), &result)
@@ -115,9 +132,9 @@ func callPaddleListUsers() map[string]interface{} {
 func getSubscriptionCurrency(SubID int) string {
 	currency := ""
 	var result map[string]interface{}
-	jsonData := map[string]interface{}{"vendor_id": PaddleVendorID, "vendor_auth_code": PaddleAuthKey, "subscription_id": SubID}
+	jsonData := map[string]interface{}{"vendor_id": pwConfig.PaddleVendorID, "vendor_auth_code": pwConfig.PaddleAuthKey, "subscription_id": SubID}
 	jsonValue, _ := json.Marshal(jsonData)
-	response, err := http.Post(PaddleAPIURL+"/api/2.0/subscription/payments", "application/json", bytes.NewBuffer(jsonValue))
+	response, err := http.Post(pwConfig.PaddleAPIURL+"/api/2.0/subscription/payments", "application/json", bytes.NewBuffer(jsonValue))
 	if err != nil {
 		fmt.Printf("The List Payments API call request failed with error %s\n", err)
 	} else {
@@ -138,22 +155,37 @@ func getSubscriptionCurrency(SubID int) string {
 	return currency
 }
 
-// DEPRECATED FUNCTION END //
-
-func getPlanInfo(planID int) (string, string) {
-	planIDMap := map[int]map[string]string{
-		902:  {"name": "Test My Plan", "interval": "year"},
-		919:  {"name": "New Planz", "interval": "month"},
-		920:  {"name": "Alternate Year", "interval": "year"},
-		1018: {"name": "Free Plan Daily", "interval": "month"},
-		1153: {"name": "Quantity Test", "interval": "year"},
-		1195: {"name": "Framer Monthy Seats", "interval": "month"},
-		1196: {"name": "Framer Annual Seats", "interval": "year"},
-	}
-
+// This needs to be a map of Paddle Plan ID to the name and interval of that plan
+func getPlanInfo(planID int, planIDMap map[int]map[string]string) (string, string) {
 	planIDName := planIDMap[planID]["name"]
 	planInterval := planIDMap[planID]["interval"]
 	return planInterval, planIDName
+}
+
+func callPaddleListPlans() map[int]map[string]string {
+	finalResult := map[int]map[string]string{}
+	var apiResults map[string]interface{}
+	jsonData := map[string]string{"vendor_id": pwConfig.PaddleVendorID, "vendor_auth_code": pwConfig.PaddleAuthKey}
+	jsonValue, _ := json.Marshal(jsonData)
+	response, err := http.Post(pwConfig.PaddleAPIURL+"/api/2.0/subscription/plans", "application/json", bytes.NewBuffer(jsonValue))
+	if err != nil {
+		fmt.Printf("The List Plans API call request failed with error %s\n", err)
+	} else {
+		data, _ := ioutil.ReadAll(response.Body)
+		json.Unmarshal([]byte(data), &apiResults)
+		if apiResults["success"].(bool) {
+			for _, element := range apiResults["response"].([]interface{}) {
+				theMap := element.(map[string]interface{})
+				m := make(map[string]string)
+				m["name"] = theMap["name"].(string)
+				m["interval"] = theMap["billing_type"].(string)
+				finalResult[int(theMap["id"].(float64))] = m
+			}
+		} else {
+			log.Fatal("Paddle List Plans API faied, terminating script. Please make sure your config file is correct")
+		}
+	}
+	return finalResult
 }
 
 func convertToUnixTimeStamp(dateString string, withHoursMinutesSeconds bool, withMicroseconds bool) int64 {
@@ -203,7 +235,7 @@ func callProfitwellAPI(apiData map[string]interface{}) (success bool, message st
 	client := &http.Client{}
 
 	req, _ := http.NewRequest("POST", "https://api.profitwell.com/v2/subscriptions/", bytes.NewBuffer(jsonString))
-	req.Header.Set("Authorization", ProfitwellAPIKey)
+	req.Header.Set("Authorization", pwConfig.ProfitwellAPIKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, respErr := client.Do(req)
@@ -219,7 +251,6 @@ func callProfitwellAPI(apiData map[string]interface{}) (success bool, message st
 		fmt.Printf(returnMessage)
 		result = true
 	}
-	defer resp.Body.Close()
 	return result, returnMessage
 }
 
