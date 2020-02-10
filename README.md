@@ -23,3 +23,12 @@ const (
 	DryRun  = true
 )
 ```
+
+*PaddleAPIURL*: The root URL of the Paddle environment being used, usually `https://vendors.paddle.com`
+
+*EndDate*: Any subscriptions created after this DateTime will not be pushed into Profitwell
+
+*DryRun*: If set to `true`, the script will make GET requests to Paddle, but will only report errors and issues without calling Profitwell
+
+#### Current issues
+The main issue is that Profitwell relies on the "base MRR" of a subscription, and in certain circumstances, Paddle does not provide this via it's API. For example, if a subscription has different monthly costs (coupons, metered biling, etc) the Paddle List Users API only gives us payment amounts. As they are all different, it is difficult to determine the MRR value of that subscription. Any records like this from Paddle are written to a `bad_subscriptions.csv` file for review.
